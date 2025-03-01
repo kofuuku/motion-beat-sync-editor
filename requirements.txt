@@ -1,0 +1,8 @@
+# requirements.txt
+opencv-python>=4.5.0
+numpy>=1.19.0
+ultralytics  # For YOLO
+scikit-learn  # For analytics
+matplotlib  # For visualization
+tqdm  # For progress bars
+pytest  # For testing
