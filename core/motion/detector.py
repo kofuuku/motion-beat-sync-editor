@@ -1,96 +1,85 @@
 import cv2
-import argparse
-import json
+import torch
 import numpy as np
-from pathlib import Path
+from ultralytics import YOLO  # YOLOv8
 
+# Load YOLOv8 Pose Model (for keypoints)
+model = YOLO("yolov8n-pose.pt")  # Use 'yolov8s-pose.pt' for better accuracy
 
-def process_video(video_path, output_path=None, sensitivity=500):
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"Error: Could not open video {video_path}")
-        return
-    
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    if output_path is None:
-        output_path = Path(video_path).with_name(f"{Path(video_path).stem}_processed.mp4")
-    
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
-    
-    motion_data = []
-    ret, frame1 = cap.read()
-    ret, frame2 = cap.read()
-    frame_idx = 0
-    
-    while cap.isOpened() and ret:
-        diff = cv2.absdiff(frame1, frame2)
-        gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, thresh = cv2.threshold(blur, 20, 255, cv2.THRESH_BINARY)
-        dilated = cv2.dilate(thresh, None, iterations=3)
-        contours, _ = cv2.findContours(dilated, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        
-        motion_intensity = sum(cv2.contourArea(c) for c in contours) / (width * height) * 100
-        motion_data.append({
-            "frame": frame_idx,
-            "timestamp": frame_idx / fps,
-            "motion_areas": len(contours),
-            "intensity": motion_intensity
-        })
-        
-        for contour in contours:
-            if cv2.contourArea(contour) < sensitivity:
-                continue
-            x, y, w, h = cv2.boundingRect(contour)
-            cv2.rectangle(frame1, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        
-        bar_height = 5
-        bar_width = int((width * motion_intensity) / 100)
-        cv2.rectangle(frame1, (0, height - bar_height), (bar_width, height), (0, 255, 255), -1)
-        cv2.putText(frame1, f"Intensity: {motion_intensity:.1f}%", (10, height - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-        
-        out.write(frame1)
-        
-        frame1 = frame2
-        ret, frame2 = cap.read()
-        frame_idx += 1
-        
-        cv2.imshow("Motion Detection", frame1)
-        if cv2.waitKey(20) & 0xFF == ord('q'):
-            break
-    
-    cap.release()
-    out.release()
-    cv2.destroyAllWindows()
-    
-    motion_data_path = Path(output_path).with_suffix('.json')
-    with open(motion_data_path, 'w') as f:
-        json.dump({
-            "video_info": {
-                "width": width,
-                "height": height,
-                "fps": fps,
-                "frame_count": frame_count,
-                "duration": frame_count / fps
-            },
-            "frames": motion_data
-        }, f, indent=2)
-    
-    print(f"Processed video saved to {output_path}")
-    print(f"Motion data saved to {motion_data_path}")
+# Load OpenCV DNN Face Detector
+face_net = cv2.dnn.readNetFromCaffe("deploy.prototxt", "res10_300x300_ssd_iter_140000.caffemodel")
 
+# Load Video File
+video_path = "/home/khuushi/motion-beat-sync-editor/thisvid.mp4"
+cap = cv2.VideoCapture(video_path)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Motion Detection on Video with Processing")
-    parser.add_argument("video", help="Path to the input video file")
-    parser.add_argument("--output", type=str, help="Path to the output processed video file")
-    parser.add_argument("--sensitivity", type=int, default=500, help="Motion sensitivity threshold")
-    
-    args = parser.parse_args()
-    process_video(args.video, args.output, args.sensitivity)
+# Define Skeleton Connections (for YOLO Pose Estimation)
+SKELETON_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),  # Right arm
+    (0, 5), (5, 6), (6, 7), (7, 8),  # Left arm
+    (0, 9), (9, 10), (10, 11),       # Right leg
+    (0, 12), (12, 13), (13, 14),     # Left leg
+]
+
+# Process Each Frame
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break  # Exit if no frame is read
+
+    h, w = frame.shape[:2]
+
+    # Face Detection
+    blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104.0, 177.0, 123.0))
+    face_net.setInput(blob)
+    detections = face_net.forward()
+
+    for i in range(detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+        if confidence > 0.5:
+            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+            (startX, startY, endX, endY) = box.astype("int")
+            cv2.rectangle(frame, (startX, startY), (endX, endY), (0, 255, 0), 2)
+
+    # YOLOv8 Pose Detection
+    results = model(frame)
+
+    for result in results:
+        # Draw Bounding Boxes
+        if hasattr(result, "boxes") and result.boxes is not None:
+            for box in result.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])  # Bounding box
+                conf = box.conf[0].item()  # Confidence score
+                cls = int(box.cls[0].item())  # Class ID
+
+                # Draw Bounding Box
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                cv2.putText(frame, f"ID {cls}: {conf:.2f}", (x1, y1 - 5), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+        # Draw Keypoints & Skeleton
+        if hasattr(result, "keypoints") and result.keypoints is not None:
+            keypoints = result.keypoints.xy[0]  # Extract keypoints
+
+            # Draw Keypoints (Green Dots)
+            for kp in keypoints:
+                if len(kp) >= 2:  # Ensure there are at least x and y coordinates
+                    x, y = map(int, kp[:2])
+                    cv2.circle(frame, (x, y), 5, (0, 255, 0), -1)
+
+            # Draw Skeleton (Blue Lines)
+            for p1, p2 in SKELETON_CONNECTIONS:
+                if p1 < len(keypoints) and p2 < len(keypoints):
+                    x1, y1 = map(int, keypoints[p1][:2])
+                    x2, y2 = map(int, keypoints[p2][:2])
+                    cv2.line(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+
+    # Display Results
+    cv2.imshow("Video Analysis", frame)
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q') or key == 27:  # Press 'q' or 'Esc' to exit
+        break
+
+# Cleanup
+cap.release()
+cv2.destroyAllWindows()
