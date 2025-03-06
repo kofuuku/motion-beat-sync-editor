@@ -1,24 +1,37 @@
 import cv2
 import torch
 import numpy as np
-from ultralytics import YOLO  # YOLOv8
+import os
+from ultralytics import YOLO  
+from insightface.app import FaceAnalysis  # RetinaFace
 
-# Load YOLOv8 Pose Model (for keypoints)
-model = YOLO("yolov8n-pose.pt")  # Use 'yolov8s-pose.pt' for better accuracy
+# Load YOLOv8 Pose Model
+model = YOLO("yolo11n-pose.pt")  # YOLO for pose detection
 
-# Load OpenCV DNN Face Detector
-face_net = cv2.dnn.readNetFromCaffe("deploy.prototxt", "res10_300x300_ssd_iter_140000.caffemodel")
+# Load RetinaFace Model
+face_detector = FaceAnalysis(name="buffalo_l")  # Uses RetinaFace with ResNet50
+face_detector.prepare(ctx_id=0)  # Set GPU (ctx_id=0) or CPU (-1)
 
 # Load Video File
-video_path = "/home/khuushi/motion-beat-sync-editor/thisvid.mp4"
+video_path = "/home/khuushi/motion-beat-sync-editor/thisvid3.mp4"
 cap = cv2.VideoCapture(video_path)
+frame_width = int(cap.get(3))
+frame_height = int(cap.get(4))
+fps = int(cap.get(cv2.CAP_PROP_FPS))
 
-# Define Skeleton Connections (for YOLO Pose Estimation)
+# Define codec and create VideoWriter object
+output_path = "output.mp4"
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for MP4
+out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+
+# YOLO Pose Keypoint Order (COCO format)
 SKELETON_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),  # Right arm
     (0, 5), (5, 6), (6, 7), (7, 8),  # Left arm
-    (0, 9), (9, 10), (10, 11),       # Right leg
-    (0, 12), (12, 13), (13, 14),     # Left leg
+    (5, 11), (6, 12),  # Shoulders to hips
+    (11, 12),  # Hip connection
+    (11, 13), (13, 15),  # Right leg
+    (12, 14), (14, 16)   # Left leg
 ]
 
 # Process Each Frame
@@ -27,26 +40,12 @@ while cap.isOpened():
     if not ret:
         break  # Exit if no frame is read
 
-    h, w = frame.shape[:2]
-
-    # Face Detection
-    blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104.0, 177.0, 123.0))
-    face_net.setInput(blob)
-    detections = face_net.forward()
-
-    for i in range(detections.shape[2]):
-        confidence = detections[0, 0, i, 2]
-        if confidence > 0.5:
-            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-            (startX, startY, endX, endY) = box.astype("int")
-            cv2.rectangle(frame, (startX, startY), (endX, endY), (0, 255, 0), 2)
-
-    # YOLOv8 Pose Detection
+    # Run YOLO Pose Estimation
     results = model(frame)
 
     for result in results:
-        # Draw Bounding Boxes
-        if hasattr(result, "boxes") and result.boxes is not None:
+        # Draw Bounding Boxes (Optional)
+        if result.boxes is not None:
             for box in result.boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])  # Bounding box
                 conf = box.conf[0].item()  # Confidence score
@@ -58,28 +57,51 @@ while cap.isOpened():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
         # Draw Keypoints & Skeleton
-        if hasattr(result, "keypoints") and result.keypoints is not None:
-            keypoints = result.keypoints.xy[0]  # Extract keypoints
+        if result.keypoints is not None:
+            keypoints = result.keypoints.xy  # Extract all keypoints
 
-            # Draw Keypoints (Green Dots)
-            for kp in keypoints:
-                if len(kp) >= 2:  # Ensure there are at least x and y coordinates
-                    x, y = map(int, kp[:2])
-                    cv2.circle(frame, (x, y), 5, (0, 255, 0), -1)
+            for person in keypoints:
+                person = person.cpu().numpy()  # Convert to NumPy
+                if len(person) == 0:
+                    continue  # Skip if no keypoints detected
 
-            # Draw Skeleton (Blue Lines)
-            for p1, p2 in SKELETON_CONNECTIONS:
-                if p1 < len(keypoints) and p2 < len(keypoints):
-                    x1, y1 = map(int, keypoints[p1][:2])
-                    x2, y2 = map(int, keypoints[p2][:2])
-                    cv2.line(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                # Draw Keypoints (Green Dots)
+                for x, y in person:
+                    if x > 0 and y > 0:  # Check if keypoint is valid
+                        cv2.circle(frame, (int(x), int(y)), 5, (0, 255, 0), -1)
+
+                # Draw Skeleton (Blue Lines)
+                for p1, p2 in SKELETON_CONNECTIONS:
+                    if p1 < len(person) and p2 < len(person):
+                        x1, y1 = person[p1]
+                        x2, y2 = person[p2]
+
+                        if x1 > 0 and y1 > 0 and x2 > 0 and y2 > 0:  # Ensure valid points
+                            cv2.line(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
+
+    # --- Run RetinaFace for Face Detection ---
+    faces = face_detector.get(frame)  # Detect faces in the frame
+
+    for face in faces:
+        x1, y1, x2, y2 = map(int, face.bbox)  # Face bounding box
+        landmarks = face.kps  # Facial keypoints (eyes, nose, mouth, etc.)
+
+        # Draw Face Bounding Box (Red)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+
+        # Draw Facial Landmarks (Yellow)
+        for x, y in landmarks:
+            cv2.circle(frame, (int(x), int(y)), 3, (0, 255, 255), -1)
+
 
     # Display Results
-    cv2.imshow("Video Analysis", frame)
+    out.write(frame)
+    cv2.imshow("Pose + Face Detection", frame)
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q') or key == 27:  # Press 'q' or 'Esc' to exit
         break
 
 # Cleanup
 cap.release()
+out.release()
 cv2.destroyAllWindows()
